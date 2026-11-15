@@ -1,5 +1,17 @@
 # Changelog
 
+## 0.6.6
+
+- Fixed: **songs were downloaded twice** (the second copy as "… (2)"), mostly seen on Windows. Two causes:
+  - After a restart (a forced quit, an update, a crash) a download that was still running in Nicotine+ was
+    searched and fetched again when Nicotine+ didn't answer about it right away. Nicotine+ keeps its queue and
+    finished the old download too, and both copies were put in the music folder. A track now waits until its old
+    download is dealt with (about 5 minutes at most), and a finished old download is only used when the track is
+    still wanted.
+  - The same song in two channels or playlists (for example a SoundCloud channel and a Spotify playlist) could be
+    downloaded by both at the same time. The second now waits until the first is in, and is then recognised as
+    already in your collection.
+
 ## 0.6.5
 
 - Fixed: **the *Why not?* panel was dimmed and couldn't be scrolled or clicked.** The dark layer behind a panel

@@ -42,6 +42,8 @@ TRASH_DAYS = 30               # replaced files stay in the app's trash this long
 QUARANTINE_DAYS = 30          # a rejected file nobody looked at is deleted after this long (the block stays)
 LATEST_COUNT = 25             # uploads of a profile looked at in a normal check
 CATCH_UP_COUNT = 200          # looked at when none of those 25 is known (the app was off a long time)
+STALE_TRIES = 15              # times a leftover transfer is looked up before its track may be searched again
+SAME_SONG_WAIT = 600          # seconds a track waits while the same song (from another channel) is downloading
 
 
 REKORDBOX_DELAY = 30           # seconds to wait after a download before the Rekordbox XML is written again
@@ -325,12 +327,18 @@ class Engine:
 
     async def _recover_stale(self) -> None:
         """Deal with transfers from the previous session: keep files that finished meanwhile,
-        cancel the rest (the track is searched again)."""
+        cancel the rest (the track is searched again).
+        Until its old transfer is dealt with, a track is not searched (see _stale_ids): Nicotine+ keeps its
+        queue over a restart and finishes the old download by itself, so a new search would fetch the song
+        a second time and both copies would end up in the music folder (the second as "… (2)")."""
         remaining = []
         for t in self._stale:
             try:
                 info = await self.slsk.lookup(t["peer"], t["remote_file"])
-                if info and info["state"] == "COMPLETE" and info.get("local_path") and os.path.exists(info["local_path"]):
+                now = self.db.track(t["id"])
+                wanted = bool(now) and now["state"] in (states.WANTED, states.WAITING) and t["id"] not in self.active
+                if (info and info["state"] == "COMPLETE" and info.get("local_path") and os.path.exists(info["local_path"])
+                        and wanted):
                     c = Candidate(t["peer"], t["remote_file"])
                     path, why = await self._stage_and_publish(t, info["local_path"], c)
                     await self.slsk.cancel(t["peer"], t["remote_file"])   # clears the finished entry
@@ -341,9 +349,17 @@ class Engine:
                 elif info:
                     await self.slsk.cancel(t["peer"], t["remote_file"])
             except Exception:
-                log.debug("couldn't tidy up %s", t["remote_file"], exc_info=True)
-                remaining.append(t)
+                t["_tries"] = t.get("_tries", 0) + 1
+                if t["_tries"] < STALE_TRIES:
+                    log.debug("couldn't tidy up %s", t["remote_file"], exc_info=True)
+                    remaining.append(t)
+                else:       # Nicotine+ doesn't answer about it: let the track be searched again after all
+                    log.warning("gave up on the leftover transfer %s from %s", t["remote_file"], t["peer"])
         self._stale = remaining
+
+    @property
+    def _stale_ids(self) -> set[int]:
+        return {t["id"] for t in self._stale}
 
     async def _connect(self) -> None:
         if self.settings.soulseek_mode == "nicotine":
@@ -790,6 +806,8 @@ class Engine:
                             break
                         if not self.slsk.connected:
                             break
+                        if t["id"] in self._stale_ids:      # its old transfer may still finish
+                            continue
                         await self._search_track(t)
                     # Better copies (step 4): only with a free slot, one at a time.
                     if (self.settings.upgrade_mode != "off" and not paused
@@ -896,6 +914,11 @@ class Engine:
                 self.db.update_track(tid, state=states.COLLECTED, file_path=hit["path"], last_error="")
                 self.note(f"{p.display} is already in your collection.")
                 return
+            if self._same_song_active(tid, p):
+                # The same song from another channel or playlist is downloading right now. Once it is in, the
+                # collection check above recognises it; searching now would fetch it twice.
+                self.db.update_track(tid, next_attempt=time.time() + SAME_SONG_WAIT)
+                return
         self.db.update_track(tid, state=states.SEARCHING, attempts=t["attempts"] + 1)
         ranked: list[Candidate] = []
         tried: list[dict] = []                 # {"query", "results"} for "Why not?"
@@ -937,6 +960,20 @@ class Engine:
         self.db.update_track(tid, state=states.DOWNLOADING, progress=0, last_error="")
         task = asyncio.create_task(self._download(current, ranked[:MAX_CANDIDATES]))
         self.active[tid] = {"task": task, "transfer": None, "candidate": None}
+
+    def _same_song_active(self, tid: int, p) -> bool:
+        key = library.song_key(p.artist, p.title, p.version)
+        if not key[0] or not key[1]:
+            return False
+        for other_id, entry in list(self.active.items()):
+            if other_id == tid or entry.get("upgrade"):
+                continue
+            other = self.db.track(other_id)
+            if other:
+                q = self._parsed(other)
+                if library.song_key(q.artist, q.title, q.version) == key:
+                    return True
+        return False
 
     @staticmethod
     def _parsed(t: dict):

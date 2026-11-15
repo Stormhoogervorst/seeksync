@@ -752,3 +752,100 @@ def test_manual_correction_wins(setup):
     asyncio.run(go())
     t = db.track(t["id"])
     assert t["state"] == "done" and t["file_path"].endswith("Badstar - In Da Game (Dub).flac")
+
+
+def test_track_waits_while_its_old_transfer_is_unresolved(setup):
+    """After a restart Nicotine+ may still finish the old download by itself. While SeekSync can't ask about it,
+    the track must not be searched again: that fetched the song twice (the second copy as "… (2)")."""
+    eng, db, sc, slsk, tmp = setup
+    cid = db.add_channel("https://soundcloud.com/lbl", "Label", False, backlog=1)
+    asyncio.run(eng.check_channel(cid))
+    t = next(t for t in db.tracks() if t["state"] == "wanted")
+    db.update_track(t["id"], state="downloading", peer="p", remote_file="@@a\\Old One - Gamma.flac")
+    landed = tmp / "in" / "Old One - Gamma.flac"
+    answer = {"up": False}
+
+    async def lookup(user, path):
+        if not answer["up"]:
+            raise TimeoutError("Nicotine+ is busy")
+        landed.write_bytes(b"x")
+        return {"state": "COMPLETE", "local_path": str(landed)}
+
+    async def cancel(user, path):
+        pass
+
+    slsk.lookup, slsk.cancel = lookup, cancel
+
+    async def scenario():
+        eng._stale = db.interrupted_transfers()
+        db.reset_interrupted()
+        await eng._recover_stale()                   # Nicotine+ doesn't answer yet
+        assert eng._stale and t["id"] in eng._stale_ids
+        due = [x["id"] for x in db.due_tracks(time.time())]
+        assert t["id"] in due                        # it is wanted again...
+        loop = asyncio.create_task(eng._search_loop())
+        for _ in range(20):
+            await _real_sleep(0)
+        loop.cancel()
+        assert slsk.searches == [] and not eng.active   # ...but not searched while the old transfer may finish
+        answer["up"] = True
+        await eng._recover_stale()
+
+    asyncio.run(scenario())
+    done = db.track(t["id"])
+    assert done["state"] == "done" and os.path.exists(done["file_path"])
+    assert eng._stale == []
+    files = [f for _r, _d, fs in os.walk(tmp / "out") for f in fs]
+    assert files == ["Old One - Gamma.flac"]
+
+
+def test_leftover_transfer_is_not_published_when_the_track_is_no_longer_wanted(setup):
+    eng, db, sc, slsk, tmp = setup
+    cid = db.add_channel("https://soundcloud.com/lbl", "Label", False, backlog=1)
+    asyncio.run(eng.check_channel(cid))
+    t = next(t for t in db.tracks() if t["state"] == "wanted")
+    db.update_track(t["id"], state="downloading", peer="p", remote_file="@@a\\Old One - Gamma.flac")
+    landed = tmp / "in" / "Old One - Gamma.flac"
+    landed.write_bytes(b"x")
+    cancelled = []
+
+    async def lookup(user, path):
+        return {"state": "COMPLETE", "local_path": str(landed)}
+
+    async def cancel(user, path):
+        cancelled.append(path)
+
+    slsk.lookup, slsk.cancel = lookup, cancel
+    eng._stale = db.interrupted_transfers()
+    db.reset_interrupted()
+    db.update_track(t["id"], state="done", file_path=str(tmp / "out" / "already.flac"))   # got it another way meanwhile
+    asyncio.run(eng._recover_stale())
+    assert cancelled and not os.path.exists(tmp / "out" / "Label")
+    assert db.track(t["id"])["file_path"].endswith("already.flac")
+
+
+def test_same_song_in_two_channels_is_downloaded_once(setup):
+    """A song in a SoundCloud channel and in a playlist are two tracks. When both are due at the same time, the
+    second must wait for the first instead of downloading the song again."""
+    eng, db, sc, slsk, tmp = setup
+    sc.tracks = [TrackStub("9", "https://soundcloud.com/lbl/n", "Fresh Artist - Brand New")]
+    a = db.add_channel("https://soundcloud.com/lbl", "Label", False, backlog=1)
+    asyncio.run(eng.check_channel(a))
+    sc.tracks = [TrackStub("spotify:1", "https://open.spotify.com/track/1", "Fresh Artist - Brand New")]
+    b = db.add_channel("https://open.spotify.com/playlist/x", "Mix", False, backlog=1)
+    asyncio.run(eng.check_channel(b))
+    first, second = sorted(db.tracks(), key=lambda t: t["id"])
+    assert first["state"] == second["state"] == "wanted"
+
+    async def scenario():
+        await eng._search_track(first)
+        task = eng.active[first["id"]]["task"]
+        await eng._search_track(second)              # the first is still downloading
+        assert second["id"] not in eng.active
+        assert db.track(second["id"])["next_attempt"] > time.time() + 60
+        await task
+        await eng._search_track(db.track(second["id"]))   # the first is in now: recognised
+    asyncio.run(scenario())
+    assert db.track(first["id"])["state"] == "done"
+    assert db.track(second["id"])["state"] == "collected"
+    assert len(slsk.searches) == 1
