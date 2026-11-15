@@ -203,6 +203,14 @@ def _main_artist_tokens(artist: str) -> list[str]:
     return tokens(first, drop_stop=True)
 
 
+def song_key(artist: str, title: str, version: str, stem_key: str = "") -> tuple:
+    """Main artist, title and version as one comparable value: two tracks with the same key are the same song
+    (an upload in a SoundCloud channel and the same song in a Spotify playlist, say)."""
+    v = version_of(version)
+    main = " ".join(_main_artist_tokens(artist)) or stem_key
+    return (main, title_key(title), v.kind, tuple(sorted(v.names)))
+
+
 def _same_artist(want: ParsedTitle, entry: dict, aliases: dict) -> bool:
     entry_artist = set(tokens(entry["artist"], drop_stop=True))
     everything = entry_artist | set(tokens(entry["stem"], drop_stop=True))
@@ -294,7 +302,7 @@ def duplicates(entries: list[dict], quality_profile: str = "club") -> list[dict]
     for e in entries:
         v = version_of(e["version"])
         main = " ".join(_main_artist_tokens(e["artist"])) or e["stem_key"]
-        groups.setdefault((main, e["title_key"], v.kind, tuple(sorted(v.names))), []).append(e)
+        groups.setdefault((main, e["title_key"], v.kind, tuple(sorted(v.names))), []).append(e)   # = song_key, with the stored title_key
     out = []
     for (_artist, _title, _kind, _names), files in groups.items():
         if len(files) < 2:
